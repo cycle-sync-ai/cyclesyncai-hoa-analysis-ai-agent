@@ -348,7 +348,7 @@ def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, 
                 
                 response = messages.data[0].content[0].text.value
                 sources = []
-                source_ids = []
+                source_citations = []
                 
                 # Extract file citations
                 for content in messages.data[0].content:
@@ -357,7 +357,7 @@ def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, 
                             if annotation.type == 'file_citation':
                                 file = client.files.retrieve(annotation.file_citation.file_id)
                                 sources.append(file.filename)
-                                source_ids.append(annotation.file_citation.file_id)
+                                source_citations.append(annotation.to_dict())
 
                 # Parse response sections
                 parts = response.split("SUMMARY:")
@@ -369,7 +369,7 @@ def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, 
                     "answer": detailed,
                     "summary": summary,
                     "source": ", ".join(set(sources)) if sources else "No specific sources cited",
-                    "source_ids": source_ids,
+                    "source_citations": source_citations,
                 }
             
             if run_status.status in ['failed', 'cancelled', 'expired']:
@@ -378,7 +378,7 @@ def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, 
                     "answer": f"Search failed: {run_status.status}",
                     "summary": "Document search error",
                     "source": "N/A",
-                    "source_ids": [],
+                    "source_citations": [],
                 }
                 
             time.sleep(1)
@@ -390,7 +390,7 @@ def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, 
             "answer": str(e),
             "summary": "Processing error",
             "source": "N/A",
-            "source_ids": []
+            "source_citations": []
         }
 
 def ask_questions(client: OpenAI, assistant_id: str, questions: List[str]) -> List[Dict[str, str]]:
@@ -425,7 +425,7 @@ def create_summary_table(fid_to_fpath: Dict[str, str], responses: List[Dict[str,
             summary_table.append({
                 "Category": category,
                 "Findings": response["summary"] ,
-                "Source": ", ".join([fid_to_fpath[id] for id in response["source_ids"]])
+                "Source": response["source_citations"]
             })
         else:
             summary_table.append({"Category": category, "Findings": "No information found.", "Source": "N/A"})
