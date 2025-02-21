@@ -10,6 +10,7 @@ Comprehensive script to:
 Focus on accuracy of extraction using OpenAI Assistant API. Handles token limits by iterative processing.
 """
 
+
 from datetime import datetime
 import os
 import time
@@ -23,13 +24,12 @@ from docx import Document  # For handling Word documents
 
 # Configuration
 HOA_DOCS_DIR = "./input/hoa_documents"  # Path to your HOA documents
-MODEL_NAME = "gpt-4o"  # Consider gpt-4-turbo-preview or gpt-4o for best balance of cost, speed, and token handling.
+MODEL_NAME = "gpt-4o-mini"  # Consider gpt-4-turbo-preview or gpt-4o for best balance of cost, speed, and token handling.
 ASSISTANT_NAME = "HOA Document Analyzer"
 VECTOR_STORE_NAME = "HOA Documents"
 TEMPERATURE = 0.1  # Lower temperature for higher accuracy.  Keep it low, e.g., 0.0-0.2
 MAX_RETRIES = 3 # Number of retries for API calls
 RETRY_DELAY = 5 # Delay (in seconds) between retries
-
 OUTPUT_DIR = "./output"
 
 AUTHORITY_RANKING = {
@@ -77,19 +77,29 @@ EXTRACTION_QUESTIONS = [
 client = OpenAI()
 
 class EventHandler(AssistantEventHandler):
-    @override
-    def on_tool_call_created(self, tool_call):
-        print(f"\nassistant > Tool called: {tool_call.type}\n", flush=True)
-        if tool_call.type == "file_search":
-            print("\nDebugging File Search...")
-            print("Tool Call Data:", tool_call)
+    def __init__(self):
+        self.response_content = ""
+        self.source_documents = set()
 
     @override
-    def on_message_done(self, message) -> None:
-        print("\nFinal Assistant Response:")
-        for content in message.content:
-            if hasattr(content, 'text'):
-                print(content.text.value)  # Print the assistant's response
+    def on_tool_call_created(self, tool_call):
+        print(f"\nTool called: {tool_call.type}", flush=True)
+
+    @override
+    def on_text_created(self, text):
+        self.response_content += text.value + "\n"
+        
+    @override
+    def on_file_citation_created(self, file_citation):
+        try:
+            file = client.files.retrieve(file_citation.file_id)
+            self.source_documents.add(file.filename)
+        except Exception as e:
+            print(f"Error retrieving file citation: {e}")
+
+    @override
+    def on_message_done(self, message):
+        print("\nMessage completed", flush=True)
 
 def read_word_document(file_path: str) -> str:
     """Reads a Word document and returns its text content."""
@@ -150,19 +160,15 @@ def prepare_files(hoa_docs_dir: str) -> List[Dict[str, str]]:
 def create_or_update_assistant(client: OpenAI) -> any:
     """Creates a new Assistant or updates an existing one with File Search enabled."""
     try:
-        # Attempt to retrieve an existing assistant by name
-        assistants = client.beta.assistants.list(order="desc", order_by="created_at")
+        # List existing assistants without order_by parameter
+        assistants = client.beta.assistants.list()
+        
         for asst in assistants.data:
             if asst.name == ASSISTANT_NAME:
-                print(f"Found existing assistant with ID: {asst.id}")
-                return asst  # Return the existing assistant
+                client.beta.assistants.delete(asst.id)
+                print(f"Deleted existing assistant with ID: {asst.id}")
 
-        # If no assistant with the specified name is found, create a new one
-        raise ValueError(f"No assistant found with name: {ASSISTANT_NAME}")
-    except Exception as e:
-        print(f"An error occurred while trying to retrieve the assistant: {e}")
-        print("Creating a new assistant...")
-
+        # Create fresh assistant
         assistant = client.beta.assistants.create(
             name=ASSISTANT_NAME,
             instructions=f"""
@@ -173,22 +179,7 @@ def create_or_update_assistant(client: OpenAI) -> any:
             Do NOT answer from general knowledge—only use the retrieved documents.
             
             Use this Authority Ranking to prioritize information sources (1 is highest priority):
-            1. CC&R Amendments
-            2. CC&Rs
-            3. Bylaws
-            4. Articles of Incorporation
-            5. Operating Rules
-            6. Election Rules
-            7. Annual Budget Report
-            8. Financial Statements
-            9. Reserve Study
-            10. Reserve Fund
-            11. Fine Schedule
-            12. Assessment Enforcement
-            13. Meeting Minutes
-            14. Additional Operational Policies & Guidelines
-            15. Insurance & Evidence of Insurance (COI)
-            16. Flood & General Liability Insurance
+            {json.dumps(AUTHORITY_RANKING, indent=2)}
             
             When multiple documents contain relevant information, always prioritize information from the highest-ranked source.
             Include the source document name in your response.
@@ -197,8 +188,27 @@ def create_or_update_assistant(client: OpenAI) -> any:
             tools=[{"type": "file_search"}],
             temperature=TEMPERATURE,
         )
-        print(f"Assistant created with ID: {assistant.id}")
+        print(f"Created fresh assistant with ID: {assistant.id}")
         return assistant
+
+    except Exception as e:
+        print(f"Error creating/updating assistant: {e}")
+        raise
+
+
+def verify_assistant_setup(client: OpenAI, assistant_id: str, vector_store_id: str) -> bool:
+    """Verifies the assistant is properly configured with the vector store."""
+    assistant = client.beta.assistants.retrieve(assistant_id)
+    
+    if not hasattr(assistant, 'tool_resources') or \
+       not assistant.tool_resources or \
+       not assistant.tool_resources.file_search or \
+       vector_store_id not in assistant.tool_resources.file_search.vector_store_ids:
+        print("🚨 Assistant not properly configured with vector store")
+        return False
+        
+    print("✅ Assistant properly configured with vector store")
+    return True
 
 def create_or_retrieve_vector_store(client: OpenAI) -> any:
     """Creates a new Vector Store or retrieves an existing one by name."""
@@ -220,10 +230,10 @@ def create_or_retrieve_vector_store(client: OpenAI) -> any:
         print(f"Vector store created with ID: {vector_store.id}")
         return vector_store
 
-def upload_files_to_vector_store(client: OpenAI, vector_store_id: str, files_with_content: List[Dict[str, str]]) -> None:
+def upload_files_to_vector_store(client: OpenAI, vector_store_id: str, files_with_content: List[Dict[str, str]]) -> Dict:
     """Uploads files to the vector store."""
     uploaded_file_ids = []
-
+    fid_to_fpath = {}
     for file_data in files_with_content:
         try:
             with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file_data["path"])[1], delete=False) as temp_file:
@@ -233,6 +243,7 @@ def upload_files_to_vector_store(client: OpenAI, vector_store_id: str, files_wit
             with open(temp_file_path, "rb") as file_stream:
                 uploaded_file = client.files.create(file=file_stream, purpose="assistants")
                 uploaded_file_ids.append(uploaded_file.id)
+                fid_to_fpath[uploaded_file.id] = file_data['path']
                 print(f"Uploaded file {file_data['path']} with ID: {uploaded_file.id}")
 
         except Exception as e:
@@ -268,6 +279,8 @@ def upload_files_to_vector_store(client: OpenAI, vector_store_id: str, files_wit
     else:
         print("No files were successfully uploaded.")
         exit(1)
+    
+    return fid_to_fpath
 
 def update_assistant(client: OpenAI, assistant_id: str, vector_store_id: str) -> None:
     """Updates the Assistant to use the Vector Store."""
@@ -287,97 +300,119 @@ def update_assistant(client: OpenAI, assistant_id: str, vector_store_id: str) ->
         print("✅ Assistant is correctly linked to vector store:", assistant.tool_resources.file_search.vector_store_ids)
 
 def ask_question(client: OpenAI, assistant_id: str, question: str) -> Dict[str, str]:
-    """Asks a single question to the assistant and returns the response with sources."""
-    print(f"\n--- Question: {question} ---")
-    thread = client.beta.threads.create()
+    """Vector store-enabled question handler"""
+    try:
+        # Create new thread
+        thread = client.beta.threads.create()
+        
+        # Add the question
+        client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=f"Search the documents and answer: {question}"
+        )
+        
+        # Create run with file search enabled
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=assistant_id,
+            instructions="""
+            Please address the user as Corbin. The user has a premium account. 
+            Use file search to find relevant information.
+            Prioritize extracting information from the highest-ranked document according to the Authority Ranking.
+            Provide both a detailed answer and a brief summary.
+            Be extremely accurate.
+            Format the response as:
+            DETAILED ANSWER:
+            [Your detailed response here]
 
-    # Initial message to the thread
-    client.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=question
-    )
-
-    # Retry logic for running the assistant
-    for attempt in range(MAX_RETRIES):
-        try:
-            with client.beta.threads.runs.stream(
+            SUMMARY:
+            [Your brief summary here]
+            """
+        )
+        
+        # Wait for processing
+        while True:
+            run_status = client.beta.threads.runs.retrieve(
                 thread_id=thread.id,
-                assistant_id=assistant_id,
-                instructions="""
-                    Please address the user as Corbin. The user has a premium account. 
-                    Use file search to find relevant information.
-                    Prioritize extracting information from the highest-ranked document according to the Authority Ranking.
-                    Provide both a detailed answer and a brief summary.
-                    Be extremely accurate.
-                    Format the response as:
-                    DETAILED ANSWER:
-                    [Your detailed response here]
+                run_id=run.id
+            )
+            
+            if run_status.status == 'completed':
+                # Get response with citations
+                messages = client.beta.threads.messages.list(
+                    thread_id=thread.id,
+                    order="desc",
+                    limit=1
+                )
+                
+                response = messages.data[0].content[0].text.value
+                sources = []
+                source_ids = []
+                
+                # Extract file citations
+                for content in messages.data[0].content:
+                    if hasattr(content, 'text'):
+                        for annotation in content.text.annotations:
+                            if annotation.type == 'file_citation':
+                                file = client.files.retrieve(annotation.file_citation.file_id)
+                                sources.append(file.filename)
+                                source_ids.append(annotation.file_citation.file_id)
 
-                    SUMMARY:
-                    [Your brief summary here]
-                """,
-                event_handler=EventHandler(),
-            ) as stream:
-                stream.until_done()
-
-            break  # If successful, break out of the retry loop
-        except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)  # Wait before retrying
-            else:
-                print("Max retries reached.  Failing this question.")
+                # Parse response sections
+                parts = response.split("SUMMARY:")
+                detailed = parts[0].replace("DETAILED ANSWER:", "").strip()
+                summary = parts[1].strip() if len(parts) > 1 else detailed[:200]
+                
                 return {
                     "question": question,
-                    "answer": "Error: Could not get answer after multiple retries.",
-                    "summary": "Error: No summary available.",
-                    "source": "N/A"
+                    "answer": detailed,
+                    "summary": summary,
+                    "source": ", ".join(set(sources)) if sources else "No specific sources cited",
+                    "source_ids": source_ids,
                 }
-
-    # Retrieve messages from the thread
-    messages = client.beta.threads.messages.list(thread_id=thread.id, order="asc")
-    response_content = ""
-    source_documents = []
-
-    # Extract response content and source documents
-    for msg in messages.data:
-        if msg.role == "assistant" and msg.content:
-            for content in msg.content:
-                if content.type == "text":
-                    response_content += content.text.value + "\n"
-                    for annotation in content.text.annotations:
-                        if annotation.type == "file_citation":
-                            try:
-                                file = client.files.retrieve(annotation.file_citation.file_id)
-                                source_documents.append(file.filename)
-                            except Exception as e:
-                                print(f"Error retrieving file: {e}")
-                                
-    response_parts = response_content.strip().split("SUMMARY:")
-    detailed_answer = response_parts[0].replace("DETAILED ANSWER:", "").strip()
-    summary = response_parts[1].strip() if len(response_parts) > 1 else "No summary provided."
-
-    return {
-        "question": question,
-        "answer": detailed_answer,
-        "summary": summary,
-        "source": ", ".join(set(source_documents))
-    }
+            
+            if run_status.status in ['failed', 'cancelled', 'expired']:
+                return {
+                    "question": question,
+                    "answer": f"Search failed: {run_status.status}",
+                    "summary": "Document search error",
+                    "source": "N/A",
+                    "source_ids": [],
+                }
+                
+            time.sleep(1)
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        return {
+            "question": question,
+            "answer": str(e),
+            "summary": "Processing error",
+            "source": "N/A",
+            "source_ids": []
+        }
 
 def ask_questions(client: OpenAI, assistant_id: str, questions: List[str]) -> List[Dict[str, str]]:
-    """Asks a series of questions to the assistant and returns the responses with sources."""
-    responses = []
-    for question in questions:
-        response = ask_question(client, assistant_id, question) #call ask_question instead
-        responses.append(response)
-    return responses
+    """Sequential question processor"""
+    results = []
+    
+    for idx, question in enumerate(questions, 1):
+        print(f"\nProcessing question {idx}/{len(questions)}")
+        result = ask_question(client, assistant_id, question)
+        results.append(result)
+        time.sleep(2)  # Prevent rate limiting
+        
+    return results
 
-def create_summary_table(responses: List[Dict[str, str]]) -> List[Dict[str, str]]:
+
+
+def create_summary_table(fid_to_fpath: Dict[str, str], responses: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Generates a JSON summary table from the responses, prioritizing by authority ranking."""
     summary_table = []
     categories = [
-        "HOA Name", "Monthly Dues", "Fee Increases", "Financial Health", "Reserve Fund",
+        "HOA Name",
+          "Monthly Dues", "Fee Increases", "Financial Health", "Reserve Fund",
         "HOA Budget Allocation", "Management Reputation", "Documented Issues", "Community Rules", "Pet Policies",
         "Short-Term Rentals", "Capital Improvements", "Community Amenities", "Governance Practices", "Enforcement Measures",
         "Routine Maintenance", "Dispute Resolution", "Insurance Policies", "Legal Issues", "Resident Engagement"
@@ -390,12 +425,13 @@ def create_summary_table(responses: List[Dict[str, str]]) -> List[Dict[str, str]
             summary_table.append({
                 "Category": category,
                 "Findings": response["summary"] ,
-                "Source": response["source"]
+                "Source": ", ".join([fid_to_fpath[id] for id in response["source_ids"]])
             })
         else:
             summary_table.append({"Category": category, "Findings": "No information found.", "Source": "N/A"})
 
     return summary_table
+
 
 def main():
     """Main function to orchestrate the process."""
@@ -407,24 +443,35 @@ def main():
         assistant = create_or_update_assistant(client)
         vector_store = create_or_retrieve_vector_store(client)
 
-        # 3. Upload Files to Vector Store
-        upload_files_to_vector_store(client, vector_store.id, files_with_content)
-
-        # 4. Update Assistant
+        # 3. Upload and process files
+        fid_to_fpath = upload_files_to_vector_store(client, vector_store.id, files_with_content)
         update_assistant(client, assistant.id, vector_store.id)
-
+        
+        # 4. Verify setup before proceeding
+        if not verify_assistant_setup(client, assistant.id, vector_store.id):
+            raise Exception("Assistant setup verification failed")
+        
         # 5. Ask Questions
         responses = ask_questions(client, assistant.id, EXTRACTION_QUESTIONS)
-
-        # 6. Create Summary Table
-        summary_table = create_summary_table(responses)
-
-        # 7. Output JSON
-        print("\nJSON Summary Table:")
-        print(json.dump(os.path.join(OUTPUT_DIR, "{}-summary.json".format(datetime.now().strftime("%Y-%m-%d %h-%m-%s"))), summary_table, indent=4))
         
-        print("\nJSON Answer Table:")
-        print(json.dump(os.path.join(OUTPUT_DIR, "{}-answers.json".format(datetime.now().strftime("%Y-%m-%d %h-%m-%s"))), responses, indent=4))
+        # 6. Create Summary Table
+        summary_table = create_summary_table(fid_to_fpath, responses)
+        
+        # 7. Output JSON
+        if not os.path.exists(OUTPUT_DIR):
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        print("\nSaving JSON Summary Table...")
+        summary_fname = os.path.join(OUTPUT_DIR, "{}-summary.json".format(datetime.now().strftime("%Y-%m-%d %H-%M-%S")))
+        with open(summary_fname, "w") as s_f:
+            json.dump(summary_table, s_f, indent=4)
+        print("\nSummary Table saved as:", summary_fname)
+
+        print("\nSaving JSON Answer Table...")
+        answers_fname = os.path.join(OUTPUT_DIR, "{}-answers.json".format(datetime.now().strftime("%Y-%m-%d %H-%M-%S")))
+        with open(answers_fname, "w") as a_f:
+            json.dump(responses, a_f, indent=4)
+        print("Answers saved as:", answers_fname)
 
     except Exception as e:
         print(f"An error occurred: {e}")
