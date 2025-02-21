@@ -1,0 +1,21 @@
+
+# ignore .env file except for .env.example
+.env
+.env.*
+!.env.example
+
+# ignore python-related files
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+
+#  ignore virtual environment
+venv
+
+# resoures
+input/*
+output/*
